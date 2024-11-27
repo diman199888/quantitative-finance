@@ -1,10 +1,10 @@
-# Option Pricing
+# Quantitative Finance Projects
 
-This repository contains an implementation of a binomial tree model for option pricing.
+This repository contains my projects related to quantitative finance. Each project focuses on different aspects, including option pricing, portfolio optimization, and risk management.
 
-## File
-- `option pricing.ipynb`: A detailed Jupyter Notebook export demonstrating the pricing of options using Python.
+| Project Name       | Description                                   | Link to Project                              |
+|--------------------|-----------------------------------------------|----------------------------------------------|
+| Option Pricing     | Implementation of a binomial tree for pricing options. | [View Project](./option_pricing.ipynb)       |
+|  |  |  |
+|  | |  |
 
-## Instructions
-- Open the file in your browser to view the code and explanations.
- 
