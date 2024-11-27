@@ -5,6 +5,6 @@ This repository contains my projects related to quantitative finance. Each proje
 | Project Name       | Description                                   | Link to Project                              |
 |--------------------|-----------------------------------------------|----------------------------------------------|
 | Option Pricing     | Implementation of a binomial tree for pricing options. | [View Project](./option_pricing.ipynb)       |
-|  |  |  |
+| VAR_QE | Impact of QEs on financial markets (thesis) | [View Project](./Thesis.ipynb)  |
 |  | |  |
 
