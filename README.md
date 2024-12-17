@@ -6,5 +6,5 @@ This repository contains my projects related to quantitative finance. Each proje
 |--------------------|-----------------------------------------------|----------------------------------------------|
 | Option Pricing     | Implementation of a binomial tree for pricing options. | [View Project](./option_pricing.ipynb)       |
 | Thesis | Evaluation of the impact of QEs on financial markets by VAR and LP (thesis) | [View Project](./Thesis.ipynb)  |
-| ING ALM | Forecasting mortgage prepayments | [View Project](./ING) |
+| ALM | Forecasting mortgage prepayments | [View Project](./ALM) |
 | VaR, ES, backtesting | Discussion about different approaches to quantify risks | [View Project](./VaR.ipynb) |
