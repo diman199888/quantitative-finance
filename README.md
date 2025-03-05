@@ -8,3 +8,4 @@ This repository contains my projects related to quantitative finance. Each proje
 | Thesis | Evaluation of the impact of QEs on financial markets by VAR and LP (thesis) | [View Project](./Thesis.ipynb)  |
 | ALM | Forecasting mortgage prepayments | [View Project](./ING) |
 | VaR, ES, backtesting | Discussion about different approaches to quantify risks | [View Project](./VaR.ipynb) |
+| Arbitrage | Analysis of the persistence of arbitrage opportunities between two cryptocurrency exchanges (Bybit and HTX) | [View Project](./arbitrage) |
