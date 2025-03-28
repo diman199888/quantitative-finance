@@ -159,7 +159,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--start_date', type=str, required=True)
     parser.add_argument('--end_date', type=str, default = None)
-    parser.add_argument('--file', type=str, default=r"D:\Python\1_Files\UvA\other\fake_trades_limited_days.csv")  # Allow flexible file paths
+    parser.add_argument('--file', type=str, default=r"fake_trades_limited_days.csv") 
     args = parser.parse_args()
 
     # Fetch index components
