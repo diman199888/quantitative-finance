@@ -10,3 +10,4 @@ This repository contains my projects related to quantitative finance. Each proje
 | VaR, ES, backtesting | Discussion about different approaches to quantify risks | [View Project](./VaR.ipynb) |
 | Arbitrage | Analysis of the persistence of arbitrage opportunities between two cryptocurrency exchanges (Bybit and HTX) | [View Project](./arbitrage) |
 | Script | Script that uses an API to check whether each traded share belongs to a stock index and applies different tax rates accordingly to calculate the post-tax profit over a certain period for a series of mock trades by the FIFO method | [View Project](./script) |
+| Arbitrage_v2.0 | Applying ML models to predict the persistence of arbitrage opportunities between two cryptocurrency exchanges (Bybit and HTX) | [View Project](./crypto-arbitrage-model) |
