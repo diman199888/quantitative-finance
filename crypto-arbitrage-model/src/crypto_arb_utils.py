@@ -774,6 +774,168 @@ def final_manipulations(df: pd.DataFrame, include_first_observation: bool = True
     return arbitrage_model
 '''
 
+def feature_selection(df: pl.DataFrame, exchange1: str, exchange2: str, roll: str = '10s') -> pl.DataFrame: 
+    
+    """
+    Engineer snapshot and rolling‐window features from two merged orderbook streams.
+
+    This routine takes a fully merged, time‐indexed Polars DataFrame of level‐book
+    quotes and sizes for two exchanges, and produces a table of numeric predictors
+    that capture both the instantaneous market state and recent dynamics over a
+    specified rolling window.  It is intended as the preprocessing step before
+    fitting a model to predict whether an arbitrage opportunity will persist.
+
+    Parameters
+    ----------
+    df : pl.DataFrame (preprocessed)
+    exchange1 : str
+        Column‐name prefix for the “buy” side exchange (e.g. "HTX").
+    exchange2 : str
+        Column‐name prefix for the “sell” side exchange (e.g. "Bybit").
+    roll : str, default "10s"
+        A Polars‐compatible time interval (e.g. "10s", "500ms") over which to
+        compute rolling summary statistics *prior* to each tick.
+
+    Returns
+    -------
+    pl.DataFrame
+        A new DataFrame with:
+          - Instantaneous features:
+              • level spreads on each exchange  
+              • full‐book imbalance ratios  
+              • top‐of‐book weight  
+          - Rolling‐window aggregates (mean, std, etc.) of those same features
+            computed over the preceding `roll` interval (excluding the current tick)
+    """
+    
+    base = ['ts', "Bybit_delta_ts", 'HTX_delta_ts', 'timedelta', "arb_opportunity", 'length',
+        'till_arbitrage', 'since_last_arbitrage', 'arbitrage_start', 'active_arbitrage', 'arbitrage_id']
+
+    columns_to_roll = df.drop(base).columns
+
+    df = df.with_columns(
+    pl.col("ts").cast(pl.Datetime(time_unit='ms')))
+
+    df = df.with_columns([
+        pl.col(col).rolling_mean_by(
+            "ts",
+            window_size=roll,
+            closed="left"
+        ).alias(f"{col}_rolling_avg_{roll}") for col in columns_to_roll
+    ])
+
+    df = df.with_columns([
+        pl.col(col).rolling_min_by(
+        "ts",
+        window_size=roll,
+        closed="left"
+        ).alias(f"{col}_rolling_min_{roll}") for col in columns_to_roll
+    ])
+
+    df = df.with_columns([
+        pl.col(col).rolling_max_by(
+        "ts",
+        window_size=roll,
+        closed="left"
+        ).alias(f"{col}_rolling_max_{roll}") for col in columns_to_roll
+    ])
+
+    df_train = df.select([
+        pl.col(
+            base
+            ),
+
+        *[(pl.col(col) / pl.col(f"{col}_rolling_avg_{roll}") - 1)
+        .alias(f"{col}_vs_avg") for col in columns_to_roll],
+
+        *[(pl.col(col) / pl.col(f"{col}_rolling_min_{roll}") - 1)
+        .alias(f"{col}_vs_min") for col in columns_to_roll],
+
+        *[(pl.col(col) / pl.col(f"{col}_rolling_max_{roll}") - 1)
+        .alias(f"{col}_vs_max") for col in columns_to_roll],
+
+
+        # Spreads
+        (pl.col(f"{exchange1}_level1_price_ask") - pl.col(f"{exchange1}_level1_price_bid")
+        ).cast(pl.Float32).alias(f"{exchange1}_level1_bid_ask_spread"),
+        (pl.col(f"{exchange1}_level2_price_ask") - pl.col(f"{exchange1}_level2_price_bid")
+        ).cast(pl.Float32).alias(f"{exchange1}_level2_bid_ask_spread"),
+        (pl.col(f"{exchange1}_level3_price_ask") - pl.col(f"{exchange1}_level3_price_bid")
+        ).cast(pl.Float32).alias(f"{exchange1}_level3_bid_ask_spread"),
+
+        (pl.col(f"{exchange1}_level2_price_ask") - pl.col(f"{exchange1}_level1_price_ask")
+        ).cast(pl.Float32).alias(f"{exchange1}_level1_ask_spread"),
+        (pl.col(f"{exchange1}_level3_price_ask") - pl.col(f"{exchange1}_level2_price_ask")
+        ).cast(pl.Float32).alias(f"{exchange1}_level2_ask_spread"),
+
+        (pl.col(f"{exchange1}_level1_price_bid") - pl.col(f"{exchange1}_level2_price_bid")
+        ).cast(pl.Float32).alias(f"{exchange1}_level1_bid_spread"),
+        (pl.col(f"{exchange1}_level2_price_bid") - pl.col(f"{exchange1}_level3_price_bid")
+        ).cast(pl.Float32).alias(f"{exchange1}_level2_bid_spread"),
+
+        (pl.col(f"{exchange2}_level1_price_ask") - pl.col(f"{exchange2}_level1_price_bid")
+        ).cast(pl.Float32).alias(f"{exchange2}_level1_bid_ask_spread"),
+        (pl.col(f"{exchange2}_level2_price_ask") - pl.col(f"{exchange2}_level2_price_bid")
+        ).cast(pl.Float32).alias(f"{exchange2}_level2_bid_ask_spread"),
+        (pl.col(f"{exchange2}_level3_price_ask") - pl.col(f"{exchange2}_level3_price_bid")
+        ).cast(pl.Float32).alias(f"{exchange2}_level3_bid_ask_spread"),
+
+        (pl.col(f"{exchange2}_level1_price_bid") - pl.col(f"{exchange2}_level2_price_bid")
+        ).cast(pl.Float32).alias(f"{exchange2}_level1_bid_spread"),
+        (pl.col(f"{exchange2}_level2_price_bid") - pl.col(f"{exchange2}_level3_price_bid")
+        ).cast(pl.Float32).alias(f"{exchange2}_level2_bid_spread"),
+
+        (pl.col(f"{exchange2}_level2_price_ask") - pl.col(f"{exchange2}_level1_price_ask")
+        ).cast(pl.Float32).alias(f"{exchange2}_level1_ask_spread"),
+        (pl.col(f"{exchange2}_level3_price_ask") - pl.col(f"{exchange2}_level2_price_ask")
+        ).cast(pl.Float32).alias(f"{exchange2}_level2_ask_spread"),
+
+
+        # Imbalance
+        ((pl.col(f"{exchange1}_level1_size_bid") - pl.col(f"{exchange1}_level1_size_ask")) /
+         (pl.col(f"{exchange1}_level1_size_bid") + pl.col(f"{exchange1}_level1_size_ask"))
+        ).alias(f"{exchange1}_level1_imbalance"),
+
+        ((pl.col(f"{exchange2}_level1_size_bid") - pl.col(f"{exchange2}_level1_size_ask")) /
+         (pl.col(f"{exchange2}_level1_size_bid") + pl.col(f"{exchange2}_level1_size_ask"))
+        ).alias(f"{exchange2}_level1_imbalance"),
+
+        ((pl.col(f"{exchange1}_level1_size_bid") + pl.col(f"{exchange1}_level2_size_bid") + pl.col(f"{exchange1}_level3_size_bid") -
+          pl.col(f"{exchange1}_level1_size_ask") - pl.col(f"{exchange1}_level2_size_ask") - pl.col(f"{exchange1}_level3_size_ask")) /
+         (pl.col(f"{exchange1}_level1_size_bid") + pl.col(f"{exchange1}_level2_size_bid") + pl.col(f"{exchange1}_level3_size_bid") +
+          pl.col(f"{exchange1}_level1_size_ask") + pl.col(f"{exchange1}_level2_size_ask") + pl.col(f"{exchange1}_level3_size_ask"))
+        ).alias(f"{exchange1}_aggregated_imbalance"),
+
+        ((pl.col(f"{exchange2}_level1_size_bid") + pl.col(f"{exchange2}_level2_size_bid") + pl.col(f"{exchange2}_level3_size_bid") -
+          pl.col(f"{exchange2}_level1_size_ask") - pl.col(f"{exchange2}_level2_size_ask") - pl.col(f"{exchange2}_level3_size_ask")) /
+         (pl.col(f"{exchange2}_level1_size_bid") + pl.col(f"{exchange2}_level2_size_bid") + pl.col(f"{exchange2}_level3_size_bid") +
+          pl.col(f"{exchange2}_level1_size_ask") + pl.col(f"{exchange2}_level2_size_ask") + pl.col(f"{exchange2}_level3_size_ask"))
+        ).alias(f"{exchange2}_aggregated_imbalance"),
+
+
+        # Top-level quote weight
+        (pl.col(f"{exchange1}_level1_size_bid") /
+         (pl.col(f"{exchange1}_level1_size_bid") + pl.col(f"{exchange1}_level2_size_bid") + pl.col(f"{exchange1}_level3_size_bid"))
+        ).alias(f"{exchange1}_bid_weight"),
+
+        (pl.col(f"{exchange1}_level1_size_ask") /
+         (pl.col(f"{exchange1}_level1_size_ask") + pl.col(f"{exchange1}_level2_size_ask") + pl.col(f"{exchange1}_level3_size_ask"))
+        ).alias(f"{exchange1}_ask_weight"),
+
+        (pl.col(f"{exchange2}_level1_size_bid") /
+         (pl.col(f"{exchange2}_level1_size_bid") + pl.col(f"{exchange2}_level2_size_bid") + pl.col(f"{exchange2}_level3_size_bid"))
+        ).alias(f"{exchange2}_bid_weight"),
+
+        (pl.col(f"{exchange2}_level1_size_ask") /
+         (pl.col(f"{exchange2}_level1_size_ask") + pl.col(f"{exchange2}_level2_size_ask") + pl.col(f"{exchange2}_level3_size_ask"))
+        ).alias(f"{exchange2}_ask_weight")])
+
+    df_train = df_train.with_columns(pl.col("ts").cast(pl.Int64))
+
+    return df_train
+
+
+
 def final_manipulations(
     df: pl.DataFrame,
     include_first_observation: bool = True,
