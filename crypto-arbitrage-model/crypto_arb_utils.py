@@ -1048,7 +1048,7 @@ def final_manipulations(
             lag_frames.extend(shifted_series) # Extend the list with the new Series
         # horizontally stack the original filtered + all lags
         df = df_filtered.hstack(lag_frames)
-    logger.info(f'{id_to_exclude}')
+
     # pick which ticks to keep
     if include_first_observation:
         arb = df.filter(pl.col("arbitrage_start") == 1)
@@ -1083,5 +1083,9 @@ def final_manipulations(
         # drop any rows with nulls
         .drop_nulls()
     )
-
+    
+    logger.info(f"DataFrame processed. Number of excluded observations: {len(id_to_exclude)}\
+                \nExcluded id`s: {id_to_exclude}\
+                \nAverage arbitrage duration: {arb['length'].mean(): .0f}")
+                
     return arb
