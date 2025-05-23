@@ -1,4 +1,4 @@
-** Work in Progress **
+#### ** Work in Progress **
 
 This project analyzes the persistence of arbitrage opportunities between two cryptocurrency exchanges: Bybit and HTX. The goal is to understand under what market conditions arbitrage windows emerge and how long they last.
 
