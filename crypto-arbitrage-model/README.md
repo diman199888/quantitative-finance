@@ -23,9 +23,9 @@ The analysis is divided into two main parts:
 
 # The folder contains 2 files: 
 
-- crypto_arb_utils.py(.crypto_arb_utils.py): package with all the functions related to data mining and data processing
+- crypto_arb_utils.py(./crypto_arb_utils.py): package with all the functions related to data mining and data processing
 
-- masterfile.ipynb(.masterfile.ipynb): Colab/notebook where ML methods are applied to the preprocessed data
+- masterfile.ipynb(./masterfile.ipynb): Colab/notebook where ML methods are applied to the preprocessed data
 
 # Technologies Used
 - Python: Polars, Pandas, Scikit-learn (incl. cuML), XGBoost, Tensorflow, Optuna, WebSocket APIs, etc.
