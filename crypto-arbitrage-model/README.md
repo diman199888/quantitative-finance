@@ -28,7 +28,7 @@ The analysis is divided into two main parts:
 - masterfile.ipynb: Colab/notebook where ML methods are applied to the preprocessed data
 
 # Technologies Used
-- Python: Polars, Pandas, Scikit-learn, XGBoost, Tensorflow, Optuna, WebSocket APIs, etc.
+- Python: Polars, Pandas, Scikit-learn (incl. cuML), XGBoost, Tensorflow, Optuna, WebSocket APIs, etc.
 
 - PostgreSQL for fast local data storage
 
