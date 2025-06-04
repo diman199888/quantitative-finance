@@ -669,7 +669,7 @@ def duration_calculation(df: pl.DataFrame) -> pl.DataFrame:
                 \nNumber of arbitrages: {df_n['arbitrage_id'].max():,d}\
                 ")
     
-    return df_n
+    return df_n.unique()
 
 
 '''
