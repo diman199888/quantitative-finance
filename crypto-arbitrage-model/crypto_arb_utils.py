@@ -540,12 +540,10 @@ def strategy(df: pl.DataFrame, exchange1: str, exchange2: str) -> pl.DataFrame:
     
     return return_df
 
-
 def duration_calculation(df: pl.DataFrame) -> pl.DataFrame:
-    
+
     """
-    Identify arbitrage windows in a tick-level time series and compute their start/end markers
-    and durations.
+    Identify arbitrage windows in a tick-level time series and compute their start/end markers.
 
     For each row in `df`, which must contain:
       - `ts`: a monotonically increasing timestamp (e.g. in milliseconds)
@@ -553,229 +551,244 @@ def duration_calculation(df: pl.DataFrame) -> pl.DataFrame:
 
     this function will:
 
-    1. **Flag window boundaries**  
-       - `arbitrage_start` (bool): True on the first tick where `arb_opportunity` crosses ±0.03 from zero.  
-       - `active_arbitrage` (bool): True on every tick while |`arb_opportunity`| ≥ 0.03.  
-       - `discrepancy_start` (datetime): the timestamp of the first non-zero arbitrage tick, forward-filled  
-         so every row in that window knows when it began.  
-       - `arbitrage_end` (datetime): the timestamp of the first tick back inside (|`arb_opportunity`| < 0.03),  
-         forward-filled so every row in the next idle period knows when the prior window closed.
+    1. **Flag window boundaries**
+       - `arbitrage_start` (bool): True on the first tick where `arb_opportunity` crosses zero.
+       - `active_arbitrage` (bool): True on every tick while |`arb_opportunity`| ≥ 0.0.
+       - `arbitrage_opportunity` (datetime): True on every tick while |`arb_opportunity`| ≥ 0.03.
 
-    2. **Assign window IDs**  
-       - `arbitrage_id` (int): a running counter that increases by one on each `arbitrage_start`,  
+
+    2. **Assign window IDs**
+       - `arbitrage_id` (int): a running counter that increases by one on each `arbitrage_start`,
          but only during active windows.
+       - `has_opportunity` (int): ID's of interest (arbitrage_id with arbitrage_opportunity)
+         
+    3. **Select id's with arbitrage_opportunity and merge them back**
 
-    3. **Compute tick-to-tick intervals**  
-       - `length` (int): the difference in `ts` to the *next* tick.  
-       - Sum these `length` values per `arbitrage_id` to get the **total duration** of each window.
-
-    4. **Merge durations back**  
-       Joins the per-`arbitrage_id` summed durations into every row of that window.
-
-    5. **Compute relative times**  
-       - `till_arbitrage`: `ts – discrepancy_start`, the elapsed time since the window opened.  
-       - `since_last_arbitrage`: `ts – arbitrage_end`, the elapsed time since the last window closed.
-
+    4. **Compute relative times**
+       - `till_arbitrage`: `ts – arbitrage_start`, the elapsed time since the window opened.
+       - `since_last_arbitrage`: `ts – arbitrage_opportunity`, the elapsed time since the last window closed.
+       - `since_last_discrepancy`: `ts – active_arbitrage`, the elapsed time since the last discrepancy (non-zero value of arb_opportunity) closed.
+       
     Returns
     -------
     pl.DataFrame
         A new DataFrame with all the original columns plus:
-          - `arbitrage_start`, `active_arbitrage`, `discrepancy_start`, `arbitrage_end`
+          - `arbitrage_opportunity`
           - `arbitrage_id`
-          - `length` (inter-tick delta), and summed window duration
-          - `till_arbitrage`, `since_last_arbitrage`
+          - `till_arbitrage`, `since_last_arbitrage`, `since_last_discrepancy`
     """
 
     df_n = df.with_columns([
         # Flag arbitrage start
         (
             (
-                (pl.col("arb_opportunity") >= 0.03) & (pl.col("arb_opportunity").shift(1) < 0.03)
-            ) | (
-                (pl.col("arb_opportunity") <= -0.03) & (pl.col("arb_opportunity").shift(1) > -0.03)
-            )
-        ).alias("arbitrage_start"),
-    
-        # Flag active arbitrage rows
-        ((pl.col("arb_opportunity") >= 0.03) | (pl.col("arb_opportunity") <= -0.03)).alias("active_arbitrage"),
-
-        pl.when(
-            (
                 (pl.col("arb_opportunity") > 0.0) & (pl.col("arb_opportunity").shift(1) == 0.0)
             ) | (
                 (pl.col("arb_opportunity") < -0.0) & (pl.col("arb_opportunity").shift(1) == 0.0)
             )
-        )
-        .then(pl.col('ts'))
-        .otherwise(        
-            pl.when(
-                (
-                    (pl.col("arb_opportunity") == 0.0) & (pl.col("arb_opportunity").shift(1) > 0.0)
-                ) | (
-                    (pl.col("arb_opportunity") == -0.0) & (pl.col("arb_opportunity").shift(1) < 0.0)
-                    )
-               )
-                .then(pl.col('ts'))
-            )
-        .forward_fill()
-        .alias("discrepancy_start"), 
-
-        pl.when(
-            (
-                (pl.col("arb_opportunity") <= 0.03) & (pl.col("arb_opportunity").shift(1) >= 0.03)
-            ) | (
-                (pl.col("arb_opportunity") >= -0.03) & (pl.col("arb_opportunity").shift(1) <= -0.03)
-            )
-        ).then(pl.col('ts'))
-        .forward_fill()
-        .alias("arbitrage_end")
+        ).alias("arbitrage_start"),
+        ((pl.col("arb_opportunity") > 0.0) | (pl.col("arb_opportunity") < -0.0)).alias("active_arbitrage"),
+        ((pl.col("arb_opportunity") >= 0.03) | (pl.col("arb_opportunity") <= -0.03)).alias("arbitrage_opportunity"),
     ])
-    
+
     # Assign arbitrage_id by cumulative sum of starts
-    df_n = df_n.with_columns([
-        pl.when(pl.col("active_arbitrage"))
+    df_n = df_n.with_columns(
+
+        (pl.when(pl.col("active_arbitrage"))
         .then(pl.cum_sum("arbitrage_start"))
         .otherwise(None)
-        .alias("arbitrage_id")        
-    ])
-    
-    # Calculate tick-to-tick duration
-    df_n = df_n.with_columns([
-        (pl.col("ts").shift(-1) - pl.col("ts")).alias("length")
-    ])
-    
-    # Group by arbitrage_id and sum durations
-    durations = (
-        df_n.drop_nulls("arbitrage_id")
-        .group_by("arbitrage_id", maintain_order=True)
-        .agg(pl.sum("length"))
-        )
+        .alias("arbitrage_id")))
 
-    
-    df_n = df_n.drop("length")
-    
-    # Merge the duration info back into the original frame
-    df_n = df_n.join(durations, on="arbitrage_id", how="left")
+    active_groups = df_n.group_by("arbitrage_id").agg(
+                              pl.col("arbitrage_opportunity")
+                                .any()
+                                .alias("has_opportunity")
+                            ).filter(pl.col("has_opportunity"))
 
-    
+
+    # Assign the final arbitrage_id only to the valid active groups
+    df_n = df_n.join(active_groups, on="arbitrage_id", how="left")
+
     df_n = df_n.with_columns([
-        (pl.col("ts") - pl.col("discrepancy_start"))
-        .alias("till_arbitrage"),
-        (pl.col("ts") - pl.col("arbitrage_end"))
-        .alias("since_last_arbitrage")
-        ]).drop(['discrepancy_start', 'arbitrage_end'])
+    (pl.col("arbitrage_start") & pl.col("has_opportunity"))
+    .fill_null(False)
+    .alias("opportunity_start")
+    ])
+    df_n = df_n.with_columns([
+        pl.when(pl.col("has_opportunity"))
+        .then(pl.cum_sum("opportunity_start"))
+        .otherwise(None)
+        .alias("arbitrage_id")])
+
+    df_n = df_n.with_columns([
+
+        (pl.when(pl.col("arbitrage_start"))
+        .then(pl.col("ts"))
+        .fill_null(strategy="forward")
+        .alias('till_arbitrage')),
+
+        (pl.when((pl.col("arbitrage_opportunity").shift(1) == True) & (pl.col("arbitrage_opportunity") == False))
+        .then(pl.col("ts").shift(1))
+        .fill_null(strategy="forward")
+        .alias("since_last_arbitrage")),
+
+        (pl.when(
+            (
+                (pl.col("arb_opportunity") > 0.0).shift(1) | (pl.col("arb_opportunity") < -0.0).shift(1)
+            )
+                & (pl.col("arb_opportunity") == 0.0)
+                # & (pl.col("arbitrage_id").shift(1).is_null())
+            )
+        .then(pl.col("ts").shift(1))
+        .fill_null(strategy="forward")
+        .alias("since_last_discrepancy")),
+    ])
+
+    df_n = df_n.with_columns([
+
+        (pl.when(pl.col("arbitrage_opportunity"))
+        .then(pl.col("ts") - pl.col("till_arbitrage"))
+        .alias('till_arbitrage')),
+
+        (pl.when(pl.col("arbitrage_opportunity"))
+        .then(pl.col("ts") - pl.col("since_last_arbitrage"))
+        .alias("since_last_arbitrage")),
+
+        (pl.when(pl.col("arbitrage_opportunity"))
+        .then(pl.col("ts") - pl.col("since_last_discrepancy"))
+        .alias("since_last_discrepancy"))
+    ]).drop(["has_opportunity", "arbitrage_start",	"opportunity_start",	"active_arbitrage"])
     
     logger.info(f"DataFrame processed. \
                 \nNumber of arbitrages: {df_n['arbitrage_id'].max():,d}\
                 ")
-    
+
+
     return df_n.unique(maintain_order = True, keep = 'first')
 
-
-'''
-def final_manipulations(df: pd.DataFrame, include_first_observation: bool = True, max_delay_sec: int = 60, n_lags: int = None, 
-                        without_lags: list = ['ts','active_arbitrage','arbitrage_start','session_number','arbitrage_id','length','till_arbitrage','since_last_arbitrage','Bybit_delta_ts','HTX_delta_ts','timedelta', 'night_hours']) -> pd.DataFrame:
+def expected_prices(df_n, threshold = 100):
+    '''
+    Support function to return the dataframe consisting of prices and sizes that are used to place orders
     
-    """
-    Perform the final round of cleaning and feature‐engineering on the merged arbitrage dataset.
+    '''
+    mask = pl.when(pl.col("arb_opportunity") > 0) \
+            .then((pl.col("HTX_level1_size_ask") * pl.col("HTX_level1_price_ask") > threshold) & (pl.col("Bybit_level1_size_bid") * pl.col("Bybit_level1_price_bid") > threshold)) \
+            .otherwise(
+              pl.when(pl.col("arb_opportunity") < 0).then(pl.col("HTX_level1_size_bid") * pl.col("HTX_level1_price_bid") > threshold) & (pl.col("Bybit_level1_size_ask") * pl.col("Bybit_level1_price_ask") > threshold)
+              )
+  
+    first_ts = df_n.group_by("arbitrage_id").agg(
+        pl.col("ts")
+        .filter(pl.col("arbitrage_opportunity") & mask)
+        .first()
+        .alias("first_ts")
+    ).drop_nulls()
+  
+    expected_df = df_n.filter(
+        pl.col('ts')
+        .is_in(first_ts
+              .select(pl.col("first_ts"))
+              .to_numpy()
+              .flatten())) \
+        .select(pl.col('ts'),
+  
+            pl.when(pl.col("arb_opportunity") > 0.0)
+            .then(pl.col('HTX_level1_price_ask'))
+            .otherwise(pl.when(pl.col("arb_opportunity") < 0.0).then(pl.col('Bybit_level1_price_ask')))
+            .alias('buy_price'),
+  
+            pl.when(pl.col("arb_opportunity") > 0.0)
+            .then(pl.col('HTX_level1_size_ask'))
+            .otherwise(pl.when(pl.col("arb_opportunity") < 0.0).then(pl.col('Bybit_level1_size_ask')))
+            .alias('buy_size'),
+  
+            pl.when(pl.col("arb_opportunity") > 0.0)
+            .then(pl.col('Bybit_level1_price_bid'))
+            .otherwise(pl.when(pl.col("arb_opportunity") < 0.0).then(pl.col('HTX_level1_price_bid')))
+            .alias('sell_price'),
+  
+            pl.when(pl.col("arb_opportunity") > 0.0)
+            .then(pl.col('Bybit_level1_size_bid'))
+            .otherwise(pl.when(pl.col("arb_opportunity") < 0.0).then(pl.col('HTX_level1_size_bid')))
+            .alias('sell_size'),
+  
+            pl.when(pl.col("arb_opportunity") > 0.0)
+            .then(pl.lit('bHsB'))
+            .otherwise(pl.lit('bBsH'))
+            .alias('strategy')
+        ).drop_nulls()
+        #.unique(subset = "ts", keep = "first")
+  
+    return expected_df
 
-    This function will:
-      1. Optionally drop the very first arbitrage observation (since it is common to see arbitrages that last one tick).
-      2. Remove any arbitrage events whose inter‐arrival delay exceeds `max_delay_sec`.
-      3. Generate up to `n_lags` lagged versions of all numeric feature columns.
-      4. Return a clean DataFrame ready for modelling.
+def check(row, df_n, investment = 200, start_time = 500, open_order_minutes = 1):
+    '''
+    Support function that checks whether expected prices and sizes are still available start_time ms later from order placement
+    '''
+    ts = row[0]
+    expected_buy_price = row[1]
+    expected_buy_size = row[2]
+    expected_sell_price = row[3]
+    expected_sell_size = row[4]
+    strategy = row[5]
 
-    Parameters
-    ----------
-    df : pd.DataFrame
-        The merged, time‐sorted data from both exchanges, including columns like
-        “arbitrage_start”, per‐exchange `delta_ts`, and any other engineered features.
-    include_first_observation : bool, default=True
-        If False, drop the first arbitrage event tick that occurs.
-        If True, keep those first‐after‐gap rows.
-    max_delay_sec : int, default=60
-        Any row whose delay since the previous arbitrage (in seconds) exceeds
-        this threshold will be dropped. Helps remove spurious or stale events
-        at session boundaries.
-    n_lags : int or None, default=None
-        If an integer, create lagged features up to `n_lags` periods for every
-        numeric column (e.g. `feature`, `feature_lag_1`, …, `feature_lag_n_lags`).
-        If None, no lagged features are added.
-    without_lags : list, default = ['ts','active_arbitrage','arbitrage_start','session_number','arbitrage_id','length','till_arbitrage','since_last_arbitrage','Bybit_delta_ts','HTX_delta_ts','timedelta']
-        List of variables, lags of which would not be added in the final model
+    expected_buy_liquidity = expected_buy_price * expected_buy_size
+    expected_sell_liquidity = expected_sell_price * expected_sell_size
+    expected_arbitrage_size = min(investment, expected_buy_liquidity, expected_sell_liquidity)
 
-    Returns
-    -------
-    pd.DataFrame
-        A cleaned and fully feature‐engineered DataFrame, with:
-          - unwanted session‐boundary rows removed,
-          - excessive‐delay rows dropped,
-          - optional lag‐features appended,
-          - a fresh, zero‐based integer index.
-    """
-    
-    # To start with, we need to exclude the very first and last arbitrage observation of each recording session, as it may bring bias
-    df = df.copy()
-    df['session_number'] = np.where(
-                                        ((df.ts - df.ts.shift(1) > 5*60*1000) | (
-                                            ((df.ts - df.ts.shift(1)).isna())
-                                        )), 1, np.nan)
-    df.session_number = df.session_number.cumsum().ffill()
-    id_to_exclude = df.groupby(by = 'session_number')['arbitrage_id'].min().values
-    
-    id_to_exclude = np.append(id_to_exclude, id_to_exclude - 1)
+    filtered_df = df_n.filter(
+        (pl.col('ts') >= ts + start_time) & (pl.col('ts') <= ts + open_order_minutes*60*1000)
+    )
 
-    # We also want to get rid of the data that may be recorded with delays
-    delays = df.groupby(by = 'arbitrage_id')[['Bybit_delta_ts', 'HTX_delta_ts', 'timedelta']].max()
-    id_to_exclude = np.append(id_to_exclude,
-        delays[
-            (delays.Bybit_delta_ts > 1000*max_delay_sec) | (delays.HTX_delta_ts > 1000*max_delay_sec) | (delays.timedelta.abs() > 1000*max_delay_sec)].index
-                        )
+    if strategy == "bHsB":
+        buy_exchange = "HTX"
+        sell_exchange = "Bybit"
+    elif strategy == "bBsH":
+        buy_exchange = "Bybit"
+        sell_exchange = "HTX"
 
-    # Add lags of X's
-    if n_lags: 
-        conds = [
-            df["arbitrage_start"].shift(-lag+1).eq(1).fillna(False)
-            for lag in range(n_lags+2)]
-        
-        # Since we deal with millions of rows, in would be problematic to shift and concat the whole df. Hence, we get rid of the rows we don't need anyway
-        mask = np.logical_or.reduce(conds)
-        df_filtered = df[mask]
-        
-        lagged_dfs = []
-        
-        filtered = df_filtered.drop(columns = without_lags, errors='ignore')
-        logger.info(f"X's with {n_lags} lags: {filtered.columns}")
-        
-        for lag in range(1, n_lags+1):  
-            df_shifted = filtered.shift(lag).add_suffix(f"_lag_{lag}")
-            lagged_dfs.append(df_shifted)
-            
-        df = pd.concat([df_filtered, *lagged_dfs], axis=1)
+    if filtered_df.is_empty():
+        return False
 
-    if include_first_observation:
-        arbitrage_model = df[df.arbitrage_start == 1].copy()
-        
-    if not include_first_observation:
-        df.length = df.length.shift(1) - df.ts + df.ts.shift(1)
-        df[['till_arbitrage', 'since_last_arbitrage']] = df[['till_arbitrage', 'since_last_arbitrage']].shift(1)
-        arbitrage_model = df[(df.arbitrage_start.shift(1) == 1) & (df.active_arbitrage == 1)].copy()
-        
-    arbitrage_model['dummy'] = (arbitrage_model['length'] >= 550).astype(int)
-    arbitrage_model = arbitrage_model[~arbitrage_model.arbitrage_id.isin(id_to_exclude)]
-    arbitrage_model.drop(columns = ['arbitrage_start', 'active_arbitrage', 'session_number'], errors='ignore', inplace = True)
-    arbitrage_model.dropna(inplace = True)
-    arbitrage_model.reset_index(inplace = True, drop = True)
-    
-    logger.info(f"DataFrame processed. Number of excluded observations: {len(id_to_exclude)}\
-                \nExcluded id`s: {id_to_exclude}\
-                \nAverage arbitrage duration: {arbitrage_model['length'].mean(): .0f}")
-        
-    return arbitrage_model
-'''
+    buy_price_matrix = filtered_df.select(pl.col(f'{buy_exchange}_level{i}_price_ask' for i in (1,2,3))).to_numpy()
+    buy_size_matrix = filtered_df.select(pl.col(f'{buy_exchange}_level{i}_size_ask' for i in (1,2,3))).to_numpy()
+    sell_price_matrix = filtered_df.select(pl.col(f'{sell_exchange}_level{i}_price_bid' for i in (1,2,3))).to_numpy()
+    sell_size_matrix = filtered_df.select(pl.col(f'{sell_exchange}_level{i}_size_bid' for i in (1,2,3))).to_numpy()
 
-def feature_selection(df: pl.DataFrame, exchange1: str, exchange2: str, roll: str = '10s') -> pl.DataFrame: 
-    
+    buy_mask = buy_price_matrix <= expected_buy_price
+    sell_mask = sell_price_matrix >= expected_sell_price
+
+    if not np.any(buy_mask) or not np.any(sell_mask):
+        return False
+
+    buy_matrix_1 = buy_price_matrix[buy_mask]
+    buy_matrix_2 = buy_size_matrix[buy_mask]
+    buy_index = np.argmax(buy_matrix_2)
+    buy_matrix = np.c_[buy_matrix_1, buy_matrix_2][buy_index, :]
+
+    sell_matrix_1 = sell_price_matrix[sell_mask]
+    sell_matrix_2 = sell_size_matrix[sell_mask]
+    sell_index = np.argmax(sell_matrix_2)
+    sell_matrix = np.c_[sell_matrix_1, sell_matrix_2][sell_index, :]
+
+
+    statement = ((buy_matrix[0] * buy_matrix[1] >= expected_arbitrage_size) and (sell_matrix[0] * sell_matrix[1] >= expected_arbitrage_size))
+    return statement
+
+def df_with_dummy(expected_df, df):
+    '''
+    Main function that returns dataframe with the dummy variable: 1 if the arbitrage opportunity is persistent and 0 otherwise
+    '''
+    expected_df_with_dummy = expected_df.select(pl.col("ts"),
+        pl.Series(expected_df.map_rows(lambda row: check(row, df), return_dtype = pl.Int64)).alias("dummy")
+        )
+    df_with_dummy = df.join(expected_df_with_dummy, on = "ts", how="left")
+  
+    return df_with_dummy
+
+
+def feature_selection(df: pl.DataFrame, exchange1: str, exchange2: str, roll: str = '45s') -> pl.DataFrame:
+
     """
     Engineer snapshot and rolling‐window features from two merged orderbook streams.
 
@@ -801,20 +814,19 @@ def feature_selection(df: pl.DataFrame, exchange1: str, exchange2: str, roll: st
     pl.DataFrame
         A new DataFrame with:
           - Instantaneous features:
-              • level spreads on each exchange  
-              • full‐book imbalance ratios  
-              • top‐of‐book weight  
+              • level spreads on each exchange
+              • full‐book imbalance ratios
+              • top‐of‐book weight
           - Rolling‐window aggregates (mean, std, etc.) of those same features
             computed over the preceding `roll` interval (excluding the current tick)
     """
-    
-    base = ['ts', "Bybit_delta_ts", 'HTX_delta_ts', 'timedelta', "arb_opportunity", 'length',
-        'till_arbitrage', 'since_last_arbitrage', 'arbitrage_start', 'active_arbitrage', 'arbitrage_id']
+    base = ["ts", 'HTX_delta_ts', 'Bybit_delta_ts', 'timedelta', 'arb_opportunity', 'arbitrage_id', 'dummy', 'arbitrage_opportunity',
+            'till_arbitrage', 'since_last_arbitrage', 'since_last_discrepancy']
 
     columns_to_roll = df.drop(base).columns
 
     df = df.with_columns(
-    pl.col("ts").cast(pl.Datetime(time_unit='ms')))
+      pl.col("ts").cast(pl.Datetime(time_unit='ms')))
 
     df = df.with_columns([
         pl.col(col).rolling_mean_by(
@@ -842,7 +854,9 @@ def feature_selection(df: pl.DataFrame, exchange1: str, exchange2: str, roll: st
 
     df_train = df.select([
         pl.col(
-            base
+            ["ts", 'HTX_delta_ts', 'Bybit_delta_ts', 'timedelta', 'arb_opportunity', 'arbitrage_id', 'dummy',
+             'till_arbitrage', 'since_last_arbitrage', 'since_last_discrepancy',
+             'HTX_level1_size_bid', 'Bybit_level1_size_bid','HTX_level1_size_ask','Bybit_level1_size_ask']
             ),
 
         *[(pl.col(col) / pl.col(f"{col}_rolling_avg_{roll}") - 1)
@@ -853,7 +867,6 @@ def feature_selection(df: pl.DataFrame, exchange1: str, exchange2: str, roll: st
 
         *[(pl.col(col) / pl.col(f"{col}_rolling_max_{roll}") - 1)
         .alias(f"{col}_vs_max") for col in columns_to_roll],
-
 
         # Spreads
         (pl.col(f"{exchange1}_level1_price_ask") - pl.col(f"{exchange1}_level1_price_bid")
@@ -928,9 +941,10 @@ def feature_selection(df: pl.DataFrame, exchange1: str, exchange2: str, roll: st
 
         (pl.col(f"{exchange2}_level1_size_ask") /
          (pl.col(f"{exchange2}_level1_size_ask") + pl.col(f"{exchange2}_level2_size_ask") + pl.col(f"{exchange2}_level3_size_ask"))
-        ).alias(f"{exchange2}_ask_weight")])
+        ).alias(f"{exchange2}_ask_weight"),
 
-    df_train = df_train.with_columns(pl.col("ts").cast(pl.Int64))
+
+        ])
 
     return df_train
 
@@ -938,13 +952,12 @@ def feature_selection(df: pl.DataFrame, exchange1: str, exchange2: str, roll: st
 
 def final_manipulations(
     df: pl.DataFrame,
-    include_first_observation: bool = True,
     max_delay_sec: int = 60,
     n_lags: int | None = None,
     without_lags: list[str] = [
         'ts','active_arbitrage','arbitrage_start','session_number',
         'arbitrage_id','length','till_arbitrage','since_last_arbitrage',
-        'Bybit_delta_ts','HTX_delta_ts','timedelta','night_hours'
+        'Bybit_delta_ts','HTX_delta_ts','timedelta','night_hours', 'dummy'
     ],
 ) -> pl.DataFrame:
     """
@@ -984,6 +997,7 @@ def final_manipulations(
           - optional lag‐features appended,
           - a fresh, zero‐based integer index.
     """
+
     # To start with, we need to exclude the very first and last arbitrage observation of each recording session, as it may bring bias
     df = df.with_columns([
         # flag a new session when gap > 5 minutes
@@ -995,7 +1009,7 @@ def final_manipulations(
         pl.col("is_session_break").cum_sum().alias("session_number")
     ]).drop("is_session_break")
 
-    
+
     session_mins = df.group_by("session_number").agg(
         pl.col("arbitrage_id").min().alias("first_id")
     ).drop_nulls()
@@ -1026,17 +1040,17 @@ def final_manipulations(
     if n_lags:
         # build a mask that keeps all ticks up to n_lags
         conds = [
-            pl.col("arbitrage_start")
-              .shift(-lag + 1)
-              .eq(1)
+            pl.col("dummy")
+              .shift(-lag)
+              .is_not_null()
               .fill_null(False)
             for lag in range(n_lags + 2)
         ]
-        # Since we deal with millions of rows, in would be problematic to shift and concat the whole df. 
+        # Since we deal with millions of rows, in would be problematic to shift and concat the whole df.
         # Hence, we get rid of the rows we don't need anyway
         mask = reduce(lambda a, b: a | b, conds)
         df_filtered = df.filter(mask)
-        
+
         to_lag = [c for c in df_filtered.columns if c not in without_lags]
         base = df_filtered.select(to_lag)
 
@@ -1049,28 +1063,8 @@ def final_manipulations(
         # horizontally stack the original filtered + all lags
         df = df_filtered.hstack(lag_frames)
 
-    # pick which ticks to keep
-    if include_first_observation:
-        arb = df.filter(pl.col("arbitrage_start") == 1)
-    else:
-        arb = (
-            df
-            .with_columns([
-                # recompute length & time‐since metrics lagged by 1
-                ((pl.col("length").shift(1) - pl.col("ts") + pl.col("ts").shift(1)))
-                  .alias("length"),
-                pl.col("till_arbitrage").shift(1).alias("till_arbitrage"),
-                pl.col("since_last_arbitrage").shift(1).alias("since_last_arbitrage"),
-            ])
-            .filter(
-                (pl.col("arbitrage_start").shift(1) == 1) &
-                (pl.col("active_arbitrage") == 1)
-            )
-        )
-    # dummy label
-    arb = arb.with_columns([
-        (pl.col("length") >= 550).cast(pl.Int8).alias("dummy")
-    ])
+
+    arb = df.filter(pl.col("dummy").is_not_null())
 
       # final filtering & cleanup
     arb = (
@@ -1083,9 +1077,8 @@ def final_manipulations(
         # drop any rows with nulls
         .drop_nulls()
     )
-    
+
     logger.info(f"DataFrame processed. Number of excluded observations: {len(id_to_exclude)}\
-                \nExcluded id`s: {id_to_exclude}\
-                \nAverage arbitrage duration: {arb['length'].mean(): .0f}")
-                
-    return arb
+                \nExcluded id`s: {id_to_exclude}")
+
+    return arb.unique(subset=["ts"], maintain_order=True, keep = "last")
