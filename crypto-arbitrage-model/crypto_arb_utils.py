@@ -1035,6 +1035,8 @@ def final_manipulations(
         .to_list()
     )
     id_to_exclude.update(bad_ids)
+    
+    df = df.drop(["session_number"])
 
     # Add lags of X's
     if n_lags:
@@ -1072,7 +1074,7 @@ def final_manipulations(
         # drop excluded arbitrage_id’s
         .filter(~pl.col("arbitrage_id").is_in(list(id_to_exclude)))
         # drop helper cols
-        .drop([c for c in ["arbitrage_start","active_arbitrage","session_number"]
+        .drop([c for c in ["arbitrage_start","active_arbitrage"]
                if c in arb.columns])
         # drop any rows with nulls
         .drop_nulls()
