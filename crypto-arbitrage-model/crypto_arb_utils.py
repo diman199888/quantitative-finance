@@ -17,6 +17,8 @@ import polars as pl
 import psycopg2
 import numpy as np
 from functools import reduce
+from tqdm import tqdm
+
 
 ###############################################################################
 ################## PART I: GET DATA ########################################### 
@@ -1084,3 +1086,456 @@ def final_manipulations(
                 \nExcluded id`s: {id_to_exclude}")
 
     return arb.unique(subset=["ts"], maintain_order=True, keep = "last")
+
+
+
+###############################################################################
+################## PART III: BACKTESTING ######################################
+###############################################################################
+
+
+def matrices(
+    expected_df: pl.DataFrame,
+    realized_df_buy: pl.DataFrame,
+    realized_df_sell: pl.DataFrame,
+    buy_exchange: str,
+    sell_exchange: str,
+    buy_cycle_investment: int,
+    sell_cycle_investment: int,
+    threshold: int,
+    buy_ts_list: np.ndarray = np.array([]),
+    sell_ts_list: np.ndarray = np.array([]),
+  ):
+  '''
+  This support function is used to form matrices of price-size pairs that satisfy our conditions:
+  open orders remain outstanding till either the correspoding offsetting deal is met during the trading session or till the end of the trading session.
+  '''
+  # Prices and sizes that are used for decision-making
+  expected_buy_price = expected_df.select(pl.col(f'{buy_exchange}_level1_price_ask')).item()
+  available_buy_size = expected_df.select(pl.col(f'{buy_exchange}_level1_size_ask')).item()
+
+  expected_sell_price = expected_df.select(pl.col(f'{sell_exchange}_level1_price_bid')).item()
+  available_sell_size = expected_df.select(pl.col(f'{sell_exchange}_level1_size_bid')).item()
+
+  # check liquidity volumes
+  expected_buy_liquidity = expected_buy_price * available_buy_size
+  expected_sell_liquidity = expected_sell_price * available_sell_size
+  expected_buy_arbitrage_size = min(buy_cycle_investment, expected_buy_liquidity, expected_sell_liquidity)
+  expected_sell_arbitrage_size = min(sell_cycle_investment, expected_buy_liquidity, expected_sell_liquidity)
+
+  if expected_buy_arbitrage_size >= threshold: # we are not interested in placing orders smaller than a certain amount
+
+    expected_buy_size = round(expected_buy_arbitrage_size / expected_buy_price, 2)
+    expected_sell_size = round(expected_sell_arbitrage_size / expected_buy_price, 2)
+
+    # We assume that if order is not executed immediately, it remains open till the end of the trading session. Here we form the matrices of all the potential deals
+    buy_price_matrix = realized_df_buy.select(pl.col(f'{buy_exchange}_level{i}_price_ask' for i in range(1,4))).to_numpy()
+    buy_size_matrix = realized_df_buy.select(pl.col(f'{buy_exchange}_level{i}_size_ask' for i in range(1,4))).to_numpy()
+
+    sell_price_matrix = realized_df_sell.select(pl.col(f'{sell_exchange}_level{i}_price_bid' for i in range(1,4))).to_numpy()
+    sell_size_matrix = realized_df_sell.select(pl.col(f'{sell_exchange}_level{i}_size_bid' for i in range(1,4))).to_numpy()
+
+    buy_matrix_1 = buy_price_matrix[buy_price_matrix <= expected_buy_price]
+    buy_matrix_2 = buy_size_matrix[buy_price_matrix <= expected_buy_price]
+    buy_matrix = np.c_[buy_matrix_1, buy_matrix_2]
+
+    # we want to get rid of duplicates
+    _, unique_indices = np.unique(buy_matrix, axis=0, return_index=True)
+    buy_matrix = buy_matrix[np.sort(unique_indices)]
+
+    buy_ts = np.repeat(realized_df_buy.select(pl.col('ts')).to_numpy(), 3, axis = 1)
+    buy_ts = buy_ts[buy_price_matrix <= expected_buy_price]
+    buy_ts = buy_ts[np.sort(unique_indices)]
+
+
+    buy_matrix = buy_matrix[~np.isin(buy_ts, buy_ts_list)]  #exclude observations that were used in previous cycles
+    buy_ts = buy_ts[~np.isin(buy_ts, buy_ts_list)]
+
+
+    sell_matrix_1 = sell_price_matrix[sell_price_matrix >= expected_sell_price]
+    sell_matrix_2 = sell_size_matrix[sell_price_matrix >= expected_sell_price]
+    sell_matrix = np.c_[sell_matrix_1, sell_matrix_2]
+
+    _, unique_indices = np.unique(sell_matrix, axis=0, return_index=True)
+    sell_matrix = sell_matrix[np.sort(unique_indices)]
+
+    sell_ts = np.repeat(realized_df_sell.select(pl.col('ts')).to_numpy(), 3, axis = 1)
+    sell_ts = sell_ts[sell_price_matrix >= expected_sell_price]
+    sell_ts = sell_ts[np.sort(unique_indices)]
+
+    sell_matrix = sell_matrix[~np.isin(sell_ts, sell_ts_list)]
+    sell_ts = sell_ts[~np.isin(sell_ts, sell_ts_list)]
+
+    return buy_matrix, sell_matrix, buy_ts, sell_ts, expected_sell_arbitrage_size, expected_buy_size, expected_sell_size, expected_buy_price, expected_sell_price, available_buy_size, available_sell_size
+
+  else:
+    logger.info(f'low liquidity: ${expected_sell_arbitrage_size: .2f}')
+    return
+
+
+
+def match_volume(mat: np.ndarray, target_volume: float, ts = None) -> np.ndarray:
+  '''
+  This support function is used to match available open positions with the expected order size or to match volumes between orders at two exchanges:
+  it can be the case that at one exchange the volumes are enough to execute the (expected) order,
+  while on the other exchange the price or volume might have changed faster than the order was placed.
+  Hence, all the coins beyond offsetting deals should be considered as inventories and kept till the end of the trading session, when they are sold at the market price
+  '''
+  if target_volume == 0:
+    return np.zeros((0, 2))
+
+  prices = mat[:, 0]
+  sizes  = mat[:, 1]
+
+  # 1) compute cumulative sum of sizes
+  cumsum_sizes = np.cumsum(sizes)
+
+  # 2) find the first index where cumsum_sizes >= target_volume
+  idx = np.searchsorted(cumsum_sizes, target_volume, side="left")
+
+  if idx >= len(mat):
+      # All levels are needed, but the total sum could be <= target_volume.
+      # In that case, just return the entire matrix.
+      if ts is not None:
+          return mat.copy(), ts.copy()
+      else:
+          return mat.copy()
+
+  # 3) build the trimmed matrix: take all full levels BEFORE idx,
+  #    and a partial level at idx so that we hit exactly target_volume.
+  if idx == 0:
+      # Even the very first level already exceeds target_volume,
+      # so we only take part of the first row.
+      truncated_size = target_volume
+      new_rows = np.array([[prices[0], truncated_size]])
+      if ts is not None:
+          return new_rows, ts[0]
+      else:
+          return new_rows
+
+  # Otherwise, we take all levels 0..idx-1 in full, and a partial of level idx
+  full_rows      = mat[:idx]  # all rows before idx
+  vol_before_idx = cumsum_sizes[idx - 1]  # cumulative volume up to (idx-1)
+
+  # how much volume we still need at level idx
+  expected_vol = target_volume - vol_before_idx
+  # prices[idx] is the price at that level; we allocate expected_vol volume there:
+  last_row = np.array([[prices[idx], expected_vol]])
+
+  # concatenate
+  if ts is not None:
+      return np.vstack([full_rows, last_row]), ts[:idx+1]
+  else:
+      return np.vstack([full_rows, last_row])
+
+def build_inventory_matrix(full_matrix: np.ndarray, matched: np.ndarray) -> np.ndarray:
+  '''
+  support function to calculate outstanding inventories
+  '''
+  if full_matrix.shape[0] == 0: #no inventories
+      return np.zeros((0, 2))
+  if matched.size == 0:
+      return full_matrix
+  # number of fully matched rows is matched.shape[0]
+  k = matched.shape[0]
+  # subtract matched volumes from the first k rows:
+  support = full_matrix[:k].copy()
+  support[:,1] = support[:,1] - matched[:,1]
+
+  # if there is a “next” level that was partially used, append it:
+  if k < full_matrix.shape[0]:
+      support = np.vstack([support, full_matrix[k:]])
+  return support
+
+
+def backtesing(trained_model, scaler, arbitrage_model, df_n, trading_hours, HTX_execution_time, Bybit_execution_time, capital, investment, threshold, start_timestamp_ms):
+  '''
+  The main function to backtest different models by calculating the PnL.
+  '''
+  # Set logger module to save data in a log file
+  # 1) Grab the root logger (or grab a named one if you created one in your notebook)
+  root = logging.getLogger()  
+  root.setLevel(logging.INFO)
+
+  # 2) Remove all existing handlers (so nothing logs to the notebook)
+  for h in root.handlers[:]:
+      root.removeHandler(h)
+
+  # 3) Create a FileHandler that writes to /content/backtest.log
+  fh = logging.FileHandler("backtest.log", mode="a")
+  fh.setLevel(logging.INFO)
+  fh.setFormatter(
+      logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+  )
+  root.addHandler(fh)
+
+  total_missed_opportunity = 0
+  total_expected_profit = 0
+  total_realized_profit = 0
+  buy_ts_list = np.array([])
+  sell_ts_list = np.array([])
+  number_of_bBsH = 0
+  number_of_bHsB = 0
+  HTX_funds = capital*0.95 #since most of the buy deals are happening at HTX, we allocate more capital there
+  Bybit_funds = capital*0.05
+  LTC_fee = 0.001
+  USDt_fee = 1
+
+  # Calculate the end timestamp (hours later in milliseconds)
+  duration_ms = trading_hours * 60 * 60 * 1000
+  end_timestamp_ms = start_timestamp_ms + duration_ms
+
+  # Filter the DataFrame for the 24-hour period
+  df_filtered = df_n.filter(
+      (pl.col('ts') >= start_timestamp_ms) & (pl.col('ts') <= end_timestamp_ms)
+  )
+
+  start = df_filtered.select(pl.col('ts'))[0].item()
+  end = df_filtered.select(pl.col('ts'))[-1].item()
+
+  row_start = arbitrage_model[arbitrage_model.ts >= start].index[0]
+  row_end = arbitrage_model[arbitrage_model.ts <= end].index[-1]
+
+  X = arbitrage_model.drop(columns = ['ts', 'dummy', 'arbitrage_id', 'HTX_delta_ts', 'Bybit_delta_ts', 'timedelta'])
+  y = arbitrage_model["dummy"]
+
+  sleep = 0
+
+  # Predict values row by row
+  for pos in tqdm(range(row_start, row_end)):
+
+    if sleep:
+      logger.info(f'sleeping for {sleep} rows')
+      sleep -= 1
+      continue
+
+    logger.info(f'Row number: {pos} out of {row_end}')
+    now = time.time()
+
+    X_scaled = scaler.transform(X.iloc[pos:pos+1])
+    prediction = trained_model.predict(X_scaled)[0]
+    true_value = y.iloc[pos]
+    logger.info(f'prediction: {prediction};\ttrue value: {true_value}')
+    prediction_time = time.time() - now
+    if prediction_time > 0.05:
+      logger.warning(f'prediction time: {prediction_time: .2f}')
+
+    ts = arbitrage_model.loc[pos, 'ts']
+
+    # the tick info we use to predict the outcome
+    expected_df = df_filtered.filter(pl.col('ts') == ts)[0]
+
+    # the most
+    realized_df_HTX = (
+      df_filtered
+      .filter(pl.col('ts') >= (ts + HTX_execution_time + prediction_time),
+              pl.col('ts') <= (ts + 60000)) #keep order open for 1 minute
+    )
+    realized_df_Bybit = (
+      df_filtered
+      .filter(pl.col('ts') >= (ts + Bybit_execution_time + prediction_time),
+              pl.col('ts') <= (ts + 60000))
+    )
+
+    if prediction == 1:
+
+      if expected_df.select(pl.col('arb_opportunity')).item() > 0: #buy at HTX, sell at Bybit
+        strategy = "bHsB"
+
+        if HTX_funds >= investment:
+          buy_cycle_investment = sell_cycle_investment = investment
+        else:
+          buy_cycle_investment = HTX_funds
+          sell_cycle_investment = buy_cycle_investment - LTC_fee*expected_df.select(pl.col('HTX_level1_price_ask')).item()
+
+        try:
+          buy_matrix, sell_matrix, buy_ts_matrix, sell_ts_matrix, expected_arbitrage_size, expected_buy_size, expected_sell_size, expected_buy_price, expected_sell_price, available_buy_size, available_sell_size = matrices(
+              expected_df = expected_df,
+              realized_df_buy = realized_df_HTX,
+              realized_df_sell = realized_df_Bybit,
+              buy_exchange = 'HTX',
+              sell_exchange = 'Bybit',
+              buy_cycle_investment = buy_cycle_investment,
+              sell_cycle_investment = sell_cycle_investment,
+              threshold = threshold,
+              buy_ts_list = buy_ts_list,
+              sell_ts_list = sell_ts_list)
+          number_of_bHsB += 1
+
+        except Exception as e:
+            logger.warning(f'error: {e}')
+            continue
+
+
+      elif expected_df.select(pl.col('arb_opportunity')).item() < 0:
+        strategy = "bBsH"
+
+        if Bybit_funds >= investment:
+          buy_cycle_investment = sell_cycle_investment = investment
+        else:
+          buy_cycle_investment = Bybit_funds
+          sell_cycle_investment = buy_cycle_investment - LTC_fee*expected_df.select(pl.col('Bybit_level1_price_ask')).item()
+
+        try:
+          buy_matrix, sell_matrix, buy_ts_matrix, sell_ts_matrix, expected_arbitrage_size, expected_buy_size, expected_sell_size, expected_buy_price, expected_sell_price, available_buy_size, available_sell_size = matrices(
+              expected_df = expected_df,
+              realized_df_buy = realized_df_Bybit,
+              realized_df_sell = realized_df_HTX,
+              buy_exchange = 'Bybit',
+              sell_exchange = 'HTX',
+              buy_cycle_investment = buy_cycle_investment,
+              sell_cycle_investment = sell_cycle_investment,
+              threshold = threshold,
+              buy_ts_list = buy_ts_list,
+              sell_ts_list = sell_ts_list)
+          number_of_bBsH += 1
+
+        except Exception as e:
+            logger.warning(f'error: {e}')
+            continue
+
+      logger.info(f'{expected_arbitrage_size}, {expected_buy_size}, {expected_sell_size}')
+
+      if buy_matrix.size != 0:
+        realized_buy_matrix, buy_ts = match_volume(buy_matrix, expected_buy_size, buy_ts_matrix)
+        realized_buy_size = np.sum(realized_buy_matrix[:,1])
+        HTX_funds -= realized_buy_matrix[:,0] @ realized_buy_matrix[:,1] if strategy == "bHsB" else 0
+        Bybit_funds -= realized_buy_matrix[:,0] @ realized_buy_matrix[:,1] if strategy == "bBsH" else 0
+      else:
+        realized_buy_matrix = np.zeros((0, 2))
+        realized_buy_size = 0
+        buy_ts = np.nan
+
+      if sell_matrix.size != 0:
+        realized_sell_matrix, sell_ts = match_volume(sell_matrix, expected_sell_size, sell_ts_matrix)
+        realized_sell_size = np.sum(realized_sell_matrix[:,1])
+        HTX_funds += realized_sell_matrix[:,0] @ realized_sell_matrix[:,1] if strategy == "bBsH" else 0
+        Bybit_funds += realized_sell_matrix[:,0] @ realized_sell_matrix[:,1] if strategy == "bHsB" else 0
+      else:
+        realized_sell_matrix = np.zeros((0, 2))
+        realized_buy_size = 0
+        sell_ts = np.nan
+
+      if realized_buy_size == realized_sell_size:
+          buy_matched  = realized_buy_matrix
+          sell_matched = realized_sell_matrix
+          HTX_inventory_drawdown = 0
+          Bybit_inventory_drawdown = 0
+      else:
+          realized_size = min(realized_buy_size, realized_sell_size)
+          buy_matched  = match_volume(realized_buy_matrix,  realized_size)
+          sell_matched = match_volume(realized_sell_matrix, realized_size)
+          inventory_buy_matrix  = build_inventory_matrix(realized_buy_matrix,  buy_matched)
+          inventory_sell_matrix = build_inventory_matrix(realized_sell_matrix, sell_matched)
+
+          if strategy == "bHsB":
+
+            HTX_last_price = realized_df_HTX.select(pl.col('HTX_level1_price_bid'))[-1].item()
+            HTX_inventory_drawdown = (HTX_last_price - inventory_buy_matrix[:,0]) @ inventory_buy_matrix[:,1]
+
+            Bybit_last_price = realized_df_Bybit.select(pl.col('Bybit_level1_price_ask'))[-1].item()
+            Bybit_inventory_drawdown = (inventory_sell_matrix[:,0] - Bybit_last_price) @ inventory_sell_matrix[:,1]
+
+            HTX_funds += HTX_inventory_drawdown + inventory_buy_matrix[:,0] @ inventory_buy_matrix[:,1]
+            Bybit_funds += Bybit_inventory_drawdown - inventory_sell_matrix[:,0] @ inventory_sell_matrix[:,1]
+
+
+          elif strategy == "bBsH":
+
+            HTX_last_price = realized_df_HTX.select(pl.col('HTX_level1_price_ask'))[-1].item()
+            HTX_inventory_drawdown = (inventory_sell_matrix[:,0] - HTX_last_price) @ inventory_sell_matrix[:,1]
+
+            Bybit_last_price = realized_df_Bybit.select(pl.col('Bybit_level1_price_bid'))[-1].item()
+            Bybit_inventory_drawdown = (Bybit_last_price - inventory_buy_matrix[:,0]) @ inventory_buy_matrix[:,1]
+
+            HTX_funds += HTX_inventory_drawdown - inventory_sell_matrix[:,0] @ inventory_sell_matrix[:,1]
+            Bybit_funds += Bybit_inventory_drawdown + inventory_buy_matrix[:,0] @ inventory_buy_matrix[:,1]
+
+
+      buy_ts_list = np.append(buy_ts_list, buy_ts)
+      sell_ts_list = np.append(sell_ts_list, sell_ts)
+
+      realized_profit = sell_matched[:, 0] @ sell_matched[:, 1] - buy_matched[:, 0] @ buy_matched[:, 1] + HTX_inventory_drawdown + Bybit_inventory_drawdown
+      total_realized_profit += realized_profit
+
+      expected_profit = expected_arbitrage_size * (expected_sell_price/expected_buy_price - 1)
+      total_expected_profit += expected_profit
+      
+      logger.info(f"""Expected values:
+      actual ts: {ts}; {pd.to_datetime(ts, unit='ms')},
+      buy price, $: {expected_buy_price}, buy size, LTC: {available_buy_size}
+      sell price, $: {expected_sell_price}, sell size, LTC: {available_sell_size}
+      profit, $: {expected_profit:.2f}
+      """)
+
+      logger.info(f"""Realized values:
+      buy ts: {buy_ts}; {pd.to_datetime(buy_ts, unit='ms')}, buy ts diff: {buy_ts - ts},
+      sell ts: {sell_ts}; {pd.to_datetime(sell_ts, unit='ms')}, sell ts diff: {sell_ts - ts}
+      realized buy matrix: {realized_buy_matrix}, realized sell matrix: {realized_sell_matrix}
+      matched buy matrix: {buy_matched}, matched sell matrix: {sell_matched}
+      profit, $: {realized_profit:.2f}
+      """)
+      
+      logger.info(f'HTX funds, $: {HTX_funds: .2f}; Bybit funds, $: {Bybit_funds: .2f}')
+      logger.info(f'total funds excess, $: {HTX_funds + Bybit_funds - capital: .2f}')
+      logger.info(f'total realized profit, $: {total_realized_profit: .2f}')
+      
+      assert round(HTX_funds + Bybit_funds - capital, 2) == round(total_realized_profit, 2)  #sanity check
+
+
+      if (Bybit_funds <= threshold) or (HTX_funds <= threshold):
+        logger.info(f'insufficient funds')
+        # Check if there are future timestamps before accessing the index
+        future_trades = arbitrage_model[(arbitrage_model.ts >= ts + 10*60*1000)]
+        if not future_trades.empty:
+            sleep = future_trades.index[0] - pos  #10 minutes to transfer funds back and forth
+            logger.info(f'sleeping for {sleep} rows')
+            transfer_costs = LTC_fee*expected_buy_price + USDt_fee #It costs 0.001 LTC to transfer LTC (which will be used to close shorts) and then 1usdt to transfer tether back
+            logger.info(f'transfer costs, $: {transfer_costs: .2f}')
+            total_realized_profit -= transfer_costs
+            new_capital = HTX_funds + Bybit_funds - transfer_costs
+            logger.info(f'new capital, $: {new_capital: .2f}')
+            HTX_funds = new_capital*0.95
+            Bybit_funds = new_capital*0.05
+            continue
+        else:
+            break
+
+    if prediction == 0 and true_value == 1:
+      if expected_df.select(pl.col('arb_opportunity')).item() > 0:
+
+        realized_buy_price = realized_df_HTX.select(pl.col('HTX_level1_price_ask'))[0].item()
+        realized_buy_size = realized_df_HTX.select(pl.col('HTX_level1_size_ask'))[0].item()
+
+        realized_sell_price = realized_df_Bybit.select(pl.col('Bybit_level1_price_bid'))[0].item()
+        realized_sell_size = realized_df_Bybit.select(pl.col('Bybit_level1_size_bid'))[0].item()
+
+      if expected_df.select(pl.col('arb_opportunity')).item() < 0:
+
+        realized_buy_price = realized_df_Bybit.select(pl.col('Bybit_level1_price_ask'))[0].item()
+        realized_buy_size = realized_df_Bybit.select(pl.col('Bybit_level1_size_ask'))[0].item()
+
+        realized_sell_price = realized_df_HTX.select(pl.col('HTX_level1_price_bid'))[0].item()
+        realized_sell_size = realized_df_HTX.select(pl.col('HTX_level1_size_bid'))[0].item()
+
+
+      realized_buy_liquidity = realized_buy_price * realized_buy_size
+      realized_sell_liquidity = realized_sell_price * realized_sell_size
+      realized_arbitrage_size = min(investment, realized_buy_liquidity, realized_sell_liquidity)
+      missed_opportunity = realized_arbitrage_size * (realized_sell_price/realized_buy_price - 1)
+
+      logger.info(f'missed opportunity, $: {missed_opportunity: .2f}')
+      total_missed_opportunity += missed_opportunity
+
+  logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", force=True)
+  logger_ = logging.getLogger(__name__)
+  logger_.setLevel(logging.INFO)
+
+  logger_.info(f'Cycle ended. Results:')
+  logger_.info(f'total number of trades: {number_of_bHsB + number_of_bBsH}')
+  logger_.info(f'total expected profit, $: {total_expected_profit: .2f}')
+  logger_.info(f'total realized profit, $: {total_realized_profit: .2f}')
+  logger_.info(f'total missed opportunity, $: {total_missed_opportunity: .2f}')
+
+
+  return total_expected_profit, total_realized_profit, total_missed_opportunity
