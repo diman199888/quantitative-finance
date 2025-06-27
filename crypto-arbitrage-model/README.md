@@ -37,8 +37,10 @@ The analysis is divided into two main parts:
 
 - [masterfile.ipynb](./masterfile.ipynb): Colab/notebook where ML methods are applied to the preprocessed data
 
+- [backtest.log](./backtest.log): logger output of backtesting
+
 # Technologies Used
-- Python: Polars, Pandas, Scikit-learn (incl. cuML), Imblearn, XGBoost, Tensorflow, Optuna, WebSocket APIs, etc.
+- Python: Polars, Pandas, Scikit-learn (incl. cuML), Imblearn, XGBoost, Tensorflow, Optuna, WebSocket APIs, Logging etc.
 
 - PostgreSQL for fast local data storage
 
